@@ -1,0 +1,47 @@
+# 环境变量（含 API Key，绝对不能提交）
+.env
+.env.local
+.env.production
+
+# Python
+.venv/
+.pytest_cache/
+__pycache__/
+build/
+dist/
+*.egg-info/
+*.pyc
+*.pyo
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+mysql_data/
+milvus_data/
+etcd_data/
+minio_data/
+
+# 大文件/模型
+*.pth
+*.bin
+models/
+checkpoints/
+
+# 面试笔记/参考文档（不上传）
+data/*.puml
+data/*.md
+*.md
+!readme.md
+!README.md
+sql/weather_data.sql
+sql/init_tour_group_rag.py
+sql/insert_may01_data.sql
+测试问题.md
+sql/
+spider_weather.py

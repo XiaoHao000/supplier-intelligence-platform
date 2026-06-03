@@ -1,0 +1,387 @@
+version: '3.8'
+
+services:
+  # ==================== 基础设施 ====================
+
+  mysql:
+    image: mysql:8.0
+    container_name: smart-travel-mysql
+    ports:
+      - "3306:3306"
+    environment:
+      - MYSQL_ROOT_PASSWORD=${MYSQL_PASSWORD:-travel123}
+      - MYSQL_DATABASE=${MYSQL_DATABASE:-smart_travel}
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./data/init_mysql.sql:/docker-entrypoint-initdb.d/01_init.sql
+    command: --default-authentication-plugin=mysql_native_password --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_PASSWORD:-travel123}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - smart-travel-network
+    restart: unless-stopped
+
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.5
+    container_name: smart-travel-etcd
+    environment:
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+      - ETCD_SNAPSHOT_COUNT=50000
+    volumes:
+      - etcd_data:/etcd
+    command: etcd -advertise-client-urls=http://127.0.0.1:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+    networks:
+      - smart-travel-network
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio:RELEASE.2023-03-20T20-16-18Z
+    container_name: smart-travel-minio
+    environment:
+      - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY:-minioadmin}
+      - MINIO_SECRET_KEY=${MINIO_SECRET_KEY:-minioadmin}
+    volumes:
+      - minio_data:/minio_data
+    command: minio server /minio_data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - smart-travel-network
+    restart: unless-stopped
+
+  milvus:
+    image: milvusdb/milvus:v2.4.0
+    container_name: smart-travel-milvus
+    depends_on:
+      - etcd
+      - minio
+    environment:
+      - ETCD_ENDPOINTS=etcd:2379
+      - MINIO_ADDRESS=minio:9000
+      - MINIO_ACCESS_KEY_ID=${MINIO_ACCESS_KEY:-minioadmin}
+      - MINIO_SECRET_ACCESS_KEY=${MINIO_SECRET_KEY:-minioadmin}
+    volumes:
+      - milvus_data:/var/lib/milvus
+    ports:
+      - "19530:19530"
+      - "9091:9091"
+    command: milvus run standalone
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+      start_period: 40s
+    networks:
+      - smart-travel-network
+    restart: unless-stopped
+
+  # Milvus 数据初始化（旅游攻略向量数据）
+  milvus-init:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: smart-travel-milvus-init
+    environment:
+      - API_KEY=${API_KEY}
+      - MILVUS_HOST=milvus
+      - MILVUS_PORT=19530
+      - RUNNING_IN_DOCKER=true
+    depends_on:
+      milvus:
+        condition: service_healthy
+    command: ["python", "data/init_milvus.py"]
+    networks:
+      - smart-travel-network
+    restart: "no"
+
+  # ==================== MCP 工具层（票务/天气/行程/攻略） ====================
+
+  ticket-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: smart-travel-ticket-mcp
+    ports:
+      - "8001:8001"
+    environment:
+      - MYSQL_HOST=mysql
+      - MYSQL_PORT=3306
+      - MYSQL_USER=root
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD:-travel123}
+      - MYSQL_DATABASE=${MYSQL_DATABASE:-smart_travel}
+      - RUNNING_IN_DOCKER=true
+      - PYTHONUNBUFFERED=1
+    depends_on:
+      mysql:
+        condition: service_healthy
+    command: ["python", "mcp_server/mcp_ticket_server.py"]
+    networks:
+      - smart-travel-network
+    restart: unless-stopped
+
+  weather-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: smart-travel-weather-mcp
+    ports:
+      - "8002:8002"
+    environment:
+      - MYSQL_HOST=mysql
+      - MYSQL_PORT=3306
+      - MYSQL_USER=root
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD:-travel123}
+      - MYSQL_DATABASE=${MYSQL_DATABASE:-smart_travel}
+      - RUNNING_IN_DOCKER=true
+      - PYTHONUNBUFFERED=1
+    depends_on:
+      mysql:
+        condition: service_healthy
+    command: ["python", "mcp_server/mcp_weather_server.py"]
+    networks:
+      - smart-travel-network
+    restart: unless-stopped
+
+  trip-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: smart-travel-trip-mcp
+    ports:
+      - "8003:8003"
+    environment:
+      - API_KEY=${API_KEY}
+      - MYSQL_HOST=mysql
+      - MYSQL_PORT=3306
+      - MYSQL_USER=root
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD:-travel123}
+      - MYSQL_DATABASE=${MYSQL_DATABASE:-smart_travel}
+      - MILVUS_HOST=milvus
+      - MILVUS_PORT=19530
+      - RUNNING_IN_DOCKER=true
+      - PYTHONUNBUFFERED=1
+    depends_on:
+      mysql:
+        condition: service_healthy
+      milvus:
+        condition: service_healthy
+      milvus-init:
+        condition: service_completed_successfully
+    command: ["python", "mcp_server/mcp_trip_server.py"]
+    networks:
+      - smart-travel-network
+    restart: unless-stopped
+
+  guide-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: smart-travel-guide-mcp
+    ports:
+      - "8004:8004"
+    environment:
+      - API_KEY=${API_KEY}
+      - MYSQL_HOST=mysql
+      - MYSQL_PORT=3306
+      - MYSQL_USER=root
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD:-travel123}
+      - MYSQL_DATABASE=${MYSQL_DATABASE:-smart_travel}
+      - MILVUS_HOST=milvus
+      - MILVUS_PORT=19530
+      - RUNNING_IN_DOCKER=true
+      - PYTHONUNBUFFERED=1
+    depends_on:
+      mysql:
+        condition: service_healthy
+      milvus:
+        condition: service_healthy
+      milvus-init:
+        condition: service_completed_successfully
+    command: ["python", "mcp_server/mcp_guide_server.py"]
+    networks:
+      - smart-travel-network
+    restart: unless-stopped
+
+  # ==================== A2A Agent 层（票务/天气/行程/攻略） ====================
+
+  ticket-a2a:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: smart-travel-ticket-a2a
+    ports:
+      - "5006:5006"
+    environment:
+      - API_KEY=${API_KEY}
+      - BASE_URL=${BASE_URL}
+      - LLM_MODEL=${LLM_MODEL:-qwen3.5-flash}
+      - LLM_TEMPERATURE=${LLM_TEMPERATURE:-0.1}
+      - LLM_STREAMING=${LLM_STREAMING:-True}
+      - LLM_ENABLE_THINKING=${LLM_ENABLE_THINKING:-False}
+      - MYSQL_HOST=mysql
+      - MYSQL_PORT=3306
+      - MYSQL_USER=root
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD:-travel123}
+      - MYSQL_DATABASE=${MYSQL_DATABASE:-smart_travel}
+      - RUNNING_IN_DOCKER=true
+      - PYTHONUNBUFFERED=1
+      - TICKET_MCP_URL=http://ticket-mcp:8001/mcp
+    depends_on:
+      - ticket-mcp
+    command: ["python", "a2a_server/ticket_server.py"]
+    networks:
+      - smart-travel-network
+    restart: unless-stopped
+
+  weather-a2a:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: smart-travel-weather-a2a
+    ports:
+      - "5005:5005"
+    environment:
+      - API_KEY=${API_KEY}
+      - BASE_URL=${BASE_URL}
+      - LLM_MODEL=${LLM_MODEL:-qwen3.5-flash}
+      - LLM_TEMPERATURE=${LLM_TEMPERATURE:-0.1}
+      - LLM_STREAMING=${LLM_STREAMING:-True}
+      - LLM_ENABLE_THINKING=${LLM_ENABLE_THINKING:-False}
+      - MYSQL_HOST=mysql
+      - MYSQL_PORT=3306
+      - MYSQL_USER=root
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD:-travel123}
+      - MYSQL_DATABASE=${MYSQL_DATABASE:-smart_travel}
+      - RUNNING_IN_DOCKER=true
+      - PYTHONUNBUFFERED=1
+      - WEATHER_MCP_URL=http://weather-mcp:8002/mcp
+    depends_on:
+      - weather-mcp
+    command: ["python", "a2a_server/weather_server.py"]
+    networks:
+      - smart-travel-network
+    restart: unless-stopped
+
+  trip-a2a:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: smart-travel-trip-a2a
+    ports:
+      - "5007:5007"
+    environment:
+      - API_KEY=${API_KEY}
+      - BASE_URL=${BASE_URL}
+      - LLM_MODEL=${LLM_MODEL:-qwen3.5-flash}
+      - LLM_TEMPERATURE=${LLM_TEMPERATURE:-0.1}
+      - LLM_STREAMING=${LLM_STREAMING:-True}
+      - LLM_ENABLE_THINKING=${LLM_ENABLE_THINKING:-False}
+      - MYSQL_HOST=mysql
+      - MYSQL_PORT=3306
+      - MYSQL_USER=root
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD:-travel123}
+      - MYSQL_DATABASE=${MYSQL_DATABASE:-smart_travel}
+      - MILVUS_HOST=milvus
+      - MILVUS_PORT=19530
+      - RUNNING_IN_DOCKER=true
+      - PYTHONUNBUFFERED=1
+      - TRIP_MCP_URL=http://trip-mcp:8003/mcp
+    depends_on:
+      - trip-mcp
+    command: ["python", "a2a_server/trip_server.py"]
+    networks:
+      - smart-travel-network
+    restart: unless-stopped
+
+  guide-a2a:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: smart-travel-guide-a2a
+    ports:
+      - "5008:5008"
+    environment:
+      - API_KEY=${API_KEY}
+      - BASE_URL=${BASE_URL}
+      - LLM_MODEL=${LLM_MODEL:-qwen3.5-flash}
+      - LLM_TEMPERATURE=${LLM_TEMPERATURE:-0.1}
+      - LLM_STREAMING=${LLM_STREAMING:-True}
+      - LLM_ENABLE_THINKING=${LLM_ENABLE_THINKING:-False}
+      - MYSQL_HOST=mysql
+      - MYSQL_PORT=3306
+      - MYSQL_USER=root
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD:-travel123}
+      - MYSQL_DATABASE=${MYSQL_DATABASE:-smart_travel}
+      - MILVUS_HOST=milvus
+      - MILVUS_PORT=19530
+      - RUNNING_IN_DOCKER=true
+      - PYTHONUNBUFFERED=1
+      - GUIDE_MCP_URL=http://guide-mcp:8004/mcp
+    depends_on:
+      - guide-mcp
+    command: ["python", "a2a_server/guide_server.py"]
+    networks:
+      - smart-travel-network
+    restart: unless-stopped
+
+  # ==================== API 主服务 ====================
+
+  api-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: smart-travel-api
+    ports:
+      - "8085:8085"
+    environment:
+      - API_KEY=${API_KEY}
+      - BASE_URL=${BASE_URL}
+      - LLM_MODEL=${LLM_MODEL:-qwen3.5-flash}
+      - LLM_TEMPERATURE=${LLM_TEMPERATURE:-0.1}
+      - LLM_STREAMING=${LLM_STREAMING:-True}
+      - LLM_ENABLE_THINKING=${LLM_ENABLE_THINKING:-False}
+      - MYSQL_HOST=mysql
+      - MYSQL_PORT=3306
+      - MYSQL_USER=root
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD:-travel123}
+      - MYSQL_DATABASE=${MYSQL_DATABASE:-smart_travel}
+      - MILVUS_HOST=milvus
+      - MILVUS_PORT=19530
+      - RUNNING_IN_DOCKER=true
+      - PYTHONUNBUFFERED=1
+      - WEATHER_A2A_URL=http://weather-a2a:5005
+      - TICKET_A2A_URL=http://ticket-a2a:5006
+      - TRIP_A2A_URL=http://trip-a2a:5007
+      - GUIDE_A2A_URL=http://guide-a2a:5008
+    depends_on:
+      ticket-a2a:
+        condition: service_started
+      weather-a2a:
+        condition: service_started
+      trip-a2a:
+        condition: service_started
+      guide-a2a:
+        condition: service_started
+    command: ["python", "api_server.py"]
+    networks:
+      - smart-travel-network
+    restart: unless-stopped
+
+networks:
+  smart-travel-network:
+    driver: bridge
+
+volumes:
+  mysql_data:
+  etcd_data:
+  minio_data:
+  milvus_data:
